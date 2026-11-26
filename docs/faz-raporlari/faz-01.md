@@ -1,6 +1,26 @@
 # Faz 1 — Altyapı ve Veritabanı · Durum Raporu
 
-**Tarih:** 26.11.2026 · **Durum:** Kod yazıldı, **henüz derlenmedi ve test edilmedi** (aşağıya bakın).
+**Tarih:** 27.11.2026 · **Durum:** CI'da doğrulandı ✅ — mobil görünüm ve Codespaces çalıştırması henüz kontrol edilmedi.
+
+## Doğrulama sonucu (GitHub Actions, CI #30, commit `70f0fc6`)
+
+| Adım | Sonuç |
+|---|---|
+| Bağımlılık kurulumu (lockfile CI'da üretildi) | ✅ |
+| Lint (ESLint) | ✅ |
+| Tip kontrolü (shared, api, web) | ✅ |
+| Migration + seed (gerçek PostgreSQL 16) | ✅ |
+| Drift kontrolü (elle yazılan SQL ↔ Prisma şeması) | ✅ uyumlu |
+| Unit testler (`packages/shared`) | ✅ 74/74 |
+| Entegrasyon testleri (`apps/api`) | ✅ 8/8 |
+| Build (shared, api, web) | ✅ |
+| Docker imajları (api, web) | ✅ derlendi |
+| Gizli bilgi taraması (gitleaks) | ✅ sızıntı yok |
+
+**Açık kalanlar:**
+- `pnpm-lock.yaml` repoda yok; CI her çalışmada yeniden üretiyor (artifact: `pnpm-lock`). Tekrarlanabilir kurulum için repoya eklenmeli.
+- Panelin ve sitenin mobil görünümü gerçek tarayıcıda (Codespaces) kontrol edilmedi.
+- GitHub, kullanılan bazı action'ların Node 20 sürümünün kullanımdan kalktığı uyarısını veriyor (çalışmayı engellemiyor); action sürümleri güncellenecek.
 
 ## Önemli kısıt: yerel derleme yapılamadı
 
