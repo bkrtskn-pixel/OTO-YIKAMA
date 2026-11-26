@@ -1,0 +1,111 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Lint, tip kontrolü, test, build
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: kuzhan
+          POSTGRES_PASSWORD: kuzhan_ci
+          POSTGRES_DB: kuzhan
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U kuzhan -d kuzhan"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      NODE_ENV: test
+      DATABASE_URL: postgresql://kuzhan:kuzhan_ci@localhost:5432/kuzhan?schema=public
+      NEXT_TELEMETRY_DISABLED: 1
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Bağımlılıklar
+        run: |
+          if [ -f pnpm-lock.yaml ]; then
+            pnpm install --frozen-lockfile
+          else
+            echo "::warning::pnpm-lock.yaml yok — oluşturulup artifact olarak yüklenecek. Repoya eklenmeli."
+            pnpm install --no-frozen-lockfile
+          fi
+      - name: Oluşan lockfile'ı sakla
+        if: ${{ hashFiles('pnpm-lock.yaml') != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: pnpm-lock
+          path: pnpm-lock.yaml
+      - run: pnpm --filter @kuzhan/shared build
+      - run: pnpm --filter @kuzhan/api db:generate
+      - run: pnpm lint
+      - run: pnpm typecheck
+      - name: Migration + seed (gerçek PostgreSQL)
+        run: |
+          pnpm --filter @kuzhan/api db:deploy
+          pnpm --filter @kuzhan/api db:seed
+      - name: Şema ile migration'lar uyuşuyor mu (drift kontrolü)
+        working-directory: apps/api
+        env:
+          SHADOW_DATABASE_URL: postgresql://kuzhan:kuzhan_ci@localhost:5432/kuzhan_shadow?schema=public
+        run: |
+          PGPASSWORD=kuzhan_ci psql -h localhost -U kuzhan -d kuzhan -c 'CREATE DATABASE kuzhan_shadow'
+          pnpm exec prisma migrate diff \
+            --from-migrations prisma/migrations \
+            --to-schema-datamodel prisma/schema.prisma \
+            --shadow-database-url "$SHADOW_DATABASE_URL" \
+            --script > drift.sql
+          cat drift.sql
+          # Elle yazılan kısmi index'leri Prisma şemada ifade edemez; onların DROP önerisi beklenen durumdur.
+          if grep -vE '^\s*(--.*)?$|^DROP INDEX "(vehicle_orders_one_active_per_vehicle|vehicle_orders_active_idx|customer_vehicles_active_link)";$' drift.sql; then
+            echo "::error::Prisma şeması ile migration SQL'i uyuşmuyor (yukarıdaki farklara bakın)."
+            exit 1
+          fi
+      - run: pnpm test
+      - run: pnpm build
+
+  docker:
+    name: Docker imajları derleniyor mu
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: apps/api/Dockerfile
+          push: false
+          tags: kuzhan-api:ci
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: apps/web/Dockerfile
+          push: false
+          tags: kuzhan-web:ci
+
+  secrets:
+    name: Gizli bilgi taraması
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
