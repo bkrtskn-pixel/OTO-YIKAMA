@@ -1,0 +1,42 @@
+{
+  "name": "kuzhan-oto-yikama",
+  "version": "0.1.0",
+  "private": true,
+  "description": "KUZHAN Oto Yıkama Management System",
+  "packageManager": "pnpm@9.15.9",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "dev": "pnpm --filter @kuzhan/shared build && pnpm -r --parallel --filter !@kuzhan/shared dev",
+    "build": "pnpm -r build",
+    "test": "pnpm -r test",
+    "typecheck": "pnpm -r typecheck",
+    "lint": "eslint .",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "db:migrate": "pnpm --filter @kuzhan/api db:migrate",
+    "db:deploy": "pnpm --filter @kuzhan/api db:deploy",
+    "db:seed": "pnpm --filter @kuzhan/api db:seed"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.17.0",
+    "eslint": "^9.17.0",
+    "globals": "^15.14.0",
+    "prettier": "^3.4.2",
+    "typescript": "^5.7.2",
+    "typescript-eslint": "^8.19.0"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "@nestjs/core",
+      "@prisma/client",
+      "@prisma/engines",
+      "@swc/core",
+      "esbuild",
+      "prisma",
+      "sharp",
+      "unrs-resolver"
+    ]
+  }
+}
