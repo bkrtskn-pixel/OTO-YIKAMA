@@ -1,0 +1,681 @@
+// KUZHAN Oto Yıkama — Veritabanı şeması
+// Tasarım: docs/02-veri-modeli-durum-finans.md
+//
+// Kurallar:
+// - Para: *_kurus Int (kuruş). Float yok.
+// - Zaman: timestamptz (UTC). İş günü: business_date (Europe/Istanbul).
+// - Finansal tablolar append-only; düzeltme ters kayıtla (trigger'lar Faz 8'de).
+// - Bu sürüm Faz 1 çekirdek tablolarıdır. Pazarlama, izin, mesajlaşma ve
+//   anket tabloları kendi fazlarında ayrı migration ile eklenecek.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ───────────────────────────── Enumlar ─────────────────────────────
+
+enum CustomerType {
+  INDIVIDUAL
+  CORPORATE
+}
+
+enum OrderStatus {
+  WAITING
+  TAKEN_IN
+  WASHING
+  READY
+  DELIVERED
+  CANCELLED
+}
+
+enum PaymentStatus {
+  UNPAID
+  PARTIAL
+  PAID
+}
+
+enum Settlement {
+  DIRECT
+  ACCOUNT
+}
+
+enum PaymentType {
+  PAYMENT
+  REFUND
+}
+
+enum PaymentMethodKind {
+  CASH
+  CARD
+  BANK_TRANSFER
+  OTHER
+}
+
+enum CashDirection {
+  IN
+  OUT
+}
+
+enum CashSource {
+  PAYMENT
+  REFUND
+  EXPENSE
+  MANUAL
+  OPENING
+  CLOSE_ADJUSTMENT
+  REVERSAL
+}
+
+enum AccountTxDirection {
+  DEBIT
+  CREDIT
+}
+
+// ───────────────────── Kimlik, yetki, personel ─────────────────────
+
+model User {
+  id                  String    @id @default(uuid(7)) @db.Uuid
+  email               String    @unique
+  phone               String?
+  fullName            String    @map("full_name")
+  passwordHash        String    @map("password_hash")
+  isActive            Boolean   @default(true) @map("is_active")
+  mustChangePassword  Boolean   @default(true) @map("must_change_password")
+  totpSecretEncrypted String?   @map("totp_secret_encrypted")
+  lastLoginAt         DateTime? @map("last_login_at") @db.Timestamptz(6)
+  failedLoginCount    Int       @default(0) @map("failed_login_count")
+  lockedUntil         DateTime? @map("locked_until") @db.Timestamptz(6)
+  passwordChangedAt   DateTime? @map("password_changed_at") @db.Timestamptz(6)
+  createdAt           DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt           DateTime  @updatedAt @map("updated_at") @db.Timestamptz(6)
+  deletedAt           DateTime? @map("deleted_at") @db.Timestamptz(6)
+
+  roles              UserRole[]
+  sessions           UserSession[]
+  employee           Employee?
+  auditLogs          AuditLog[]
+  customerNotes      CustomerNote[]
+  ordersCreated      VehicleOrder[]
+  statusChanges      VehicleStatusHistory[]
+  paymentsReceived   Payment[]
+  cashTransactions   CashTransaction[]
+  cashDayCloses      CashDayClose[]
+  expensesCreated    Expense[]
+
+  @@map("users")
+}
+
+model Role {
+  id          String   @id @default(uuid(7)) @db.Uuid
+  key         String   @unique
+  name        String
+  description String?
+  isSystem    Boolean  @default(false) @map("is_system")
+  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt   DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  users       UserRole[]
+  permissions RolePermission[]
+
+  @@map("roles")
+}
+
+model Permission {
+  id          String @id @default(uuid(7)) @db.Uuid
+  key         String @unique
+  group       String
+  description String
+
+  roles RolePermission[]
+
+  @@map("permissions")
+}
+
+model RolePermission {
+  roleId       String @map("role_id") @db.Uuid
+  permissionId String @map("permission_id") @db.Uuid
+
+  role       Role       @relation(fields: [roleId], references: [id], onDelete: Cascade)
+  permission Permission @relation(fields: [permissionId], references: [id], onDelete: Cascade)
+
+  @@id([roleId, permissionId])
+  @@map("role_permissions")
+}
+
+model UserRole {
+  userId String @map("user_id") @db.Uuid
+  roleId String @map("role_id") @db.Uuid
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  role Role @relation(fields: [roleId], references: [id], onDelete: Restrict)
+
+  @@id([userId, roleId])
+  @@map("user_roles")
+}
+
+model UserSession {
+  id         String    @id @default(uuid(7)) @db.Uuid
+  userId     String    @map("user_id") @db.Uuid
+  tokenHash  String    @unique @map("token_hash")
+  expiresAt  DateTime  @map("expires_at") @db.Timestamptz(6)
+  lastSeenAt DateTime  @default(now()) @map("last_seen_at") @db.Timestamptz(6)
+  revokedAt  DateTime? @map("revoked_at") @db.Timestamptz(6)
+  ip         String?
+  userAgent  String?   @map("user_agent")
+  createdAt  DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@map("user_sessions")
+}
+
+/// Personel kaydı. Her personel sisteme giriş yapmaz (user_id opsiyonel),
+/// ama performans raporlarında yer alır.
+model Employee {
+  id        String    @id @default(uuid(7)) @db.Uuid
+  userId    String?   @unique @map("user_id") @db.Uuid
+  fullName  String    @map("full_name")
+  phone     String?
+  isActive  Boolean   @default(true) @map("is_active")
+  hiredAt   DateTime? @map("hired_at") @db.Date
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime  @updatedAt @map("updated_at") @db.Timestamptz(6)
+  deletedAt DateTime? @map("deleted_at") @db.Timestamptz(6)
+
+  user        User?                     @relation(fields: [userId], references: [id], onDelete: SetNull)
+  assignments VehicleOrderAssignment[]
+
+  @@map("employees")
+}
+
+// ─────────────────────── Müşteri ve araç ───────────────────────
+
+model Customer {
+  id                        String       @id @default(uuid(7)) @db.Uuid
+  fullName                  String       @map("full_name")
+  phoneE164                 String?      @map("phone_e164")
+  email                     String?
+  type                      CustomerType @default(INDIVIDUAL)
+  companyName               String?      @map("company_name")
+  taxNo                     String?      @map("tax_no")
+  whatsappOperationalOptin  Boolean      @default(false) @map("whatsapp_operational_optin")
+  kvkkNoticeAt              DateTime?    @map("kvkk_notice_at") @db.Timestamptz(6)
+  firstVisitAt              DateTime?    @map("first_visit_at") @db.Timestamptz(6)
+  lastVisitAt               DateTime?    @map("last_visit_at") @db.Timestamptz(6)
+  visitCount                Int          @default(0) @map("visit_count")
+  createdAt                 DateTime     @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt                 DateTime     @updatedAt @map("updated_at") @db.Timestamptz(6)
+  deletedAt                 DateTime?    @map("deleted_at") @db.Timestamptz(6)
+  anonymizedAt              DateTime?    @map("anonymized_at") @db.Timestamptz(6)
+
+  vehicles CustomerVehicle[]
+  notes    CustomerNote[]
+  orders   VehicleOrder[]
+  account  CustomerAccount?
+
+  @@index([phoneE164])
+  @@index([lastVisitAt])
+  @@index([fullName])
+  @@map("customers")
+}
+
+model CustomerNote {
+  id         String   @id @default(uuid(7)) @db.Uuid
+  customerId String   @map("customer_id") @db.Uuid
+  authorId   String   @map("author_id") @db.Uuid
+  body       String
+  createdAt  DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  customer Customer @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  author   User     @relation(fields: [authorId], references: [id], onDelete: Restrict)
+
+  @@index([customerId, createdAt])
+  @@map("customer_notes")
+}
+
+model VehicleType {
+  id        String   @id @default(uuid(7)) @db.Uuid
+  name      String   @unique
+  sortOrder Int      @default(0) @map("sort_order")
+  isActive  Boolean  @default(true) @map("is_active")
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  vehicles Vehicle[]
+  prices   ServicePrice[]
+  orders   VehicleOrder[]
+
+  @@map("vehicle_types")
+}
+
+model Vehicle {
+  id              String    @id @default(uuid(7)) @db.Uuid
+  /// Normalize plaka: "06ABC123" (bkz. packages/shared/src/plate.ts)
+  plateNormalized String    @unique @map("plate_normalized")
+  plateDisplay    String    @map("plate_display")
+  isForeignPlate  Boolean   @default(false) @map("is_foreign_plate")
+  brand           String?
+  model           String?
+  vehicleTypeId   String?   @map("vehicle_type_id") @db.Uuid
+  createdAt       DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt       DateTime  @updatedAt @map("updated_at") @db.Timestamptz(6)
+  deletedAt       DateTime? @map("deleted_at") @db.Timestamptz(6)
+
+  vehicleType VehicleType?      @relation(fields: [vehicleTypeId], references: [id], onDelete: SetNull)
+  customers   CustomerVehicle[]
+  orders      VehicleOrder[]
+
+  @@map("vehicles")
+}
+
+/// Müşteri–araç ilişkisi (bir müşterinin birden çok aracı, bir aracın
+/// birden çok kullanıcısı olabilir). Aktif bağlantı tekilliği migration'daki
+/// kısmi unique index ile sağlanır.
+model CustomerVehicle {
+  id         String    @id @default(uuid(7)) @db.Uuid
+  customerId String    @map("customer_id") @db.Uuid
+  vehicleId  String    @map("vehicle_id") @db.Uuid
+  isPrimary  Boolean   @default(false) @map("is_primary")
+  linkedAt   DateTime  @default(now()) @map("linked_at") @db.Timestamptz(6)
+  unlinkedAt DateTime? @map("unlinked_at") @db.Timestamptz(6)
+
+  customer Customer @relation(fields: [customerId], references: [id], onDelete: Restrict)
+  vehicle  Vehicle  @relation(fields: [vehicleId], references: [id], onDelete: Restrict)
+
+  @@index([customerId])
+  @@index([vehicleId])
+  @@map("customer_vehicles")
+}
+
+// ─────────────────────── Hizmet ve fiyat ───────────────────────
+
+model Service {
+  id              String    @id @default(uuid(7)) @db.Uuid
+  name            String
+  description     String?
+  durationMinutes Int       @map("duration_minutes")
+  discountable    Boolean   @default(true)
+  showOnWebsite   Boolean   @default(true) @map("show_on_website")
+  isActive        Boolean   @default(true) @map("is_active")
+  sortOrder       Int       @default(0) @map("sort_order")
+  /// KDV oranı baz puan: %20 = 2000
+  vatRateBps      Int       @default(2000) @map("vat_rate_bps")
+  createdAt       DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt       DateTime  @updatedAt @map("updated_at") @db.Timestamptz(6)
+  deletedAt       DateTime? @map("deleted_at") @db.Timestamptz(6)
+
+  prices     ServicePrice[]
+  orderItems VehicleOrderItem[]
+
+  @@map("services")
+}
+
+/// Tarihli fiyat geçmişi. vehicle_type_id NULL = tüm araç tipleri için.
+model ServicePrice {
+  id            String    @id @default(uuid(7)) @db.Uuid
+  serviceId     String    @map("service_id") @db.Uuid
+  vehicleTypeId String?   @map("vehicle_type_id") @db.Uuid
+  priceKurus    Int       @map("price_kurus")
+  validFrom     DateTime  @default(now()) @map("valid_from") @db.Timestamptz(6)
+  validTo       DateTime? @map("valid_to") @db.Timestamptz(6)
+  createdAt     DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  service     Service      @relation(fields: [serviceId], references: [id], onDelete: Restrict)
+  vehicleType VehicleType? @relation(fields: [vehicleTypeId], references: [id], onDelete: Restrict)
+
+  @@index([serviceId, vehicleTypeId, validFrom])
+  @@map("service_prices")
+}
+
+// ─────────────────────── Araç kabul ───────────────────────
+
+model VehicleOrder {
+  id                    String        @id @default(uuid(7)) @db.Uuid
+  orderNo               String        @unique @map("order_no")
+  customerId            String        @map("customer_id") @db.Uuid
+  vehicleId             String        @map("vehicle_id") @db.Uuid
+  vehicleTypeId         String?       @map("vehicle_type_id") @db.Uuid
+  customerNameSnapshot  String        @map("customer_name_snapshot")
+  plateSnapshot         String        @map("plate_snapshot")
+  status                OrderStatus   @default(WAITING)
+  paymentStatus         PaymentStatus @default(UNPAID) @map("payment_status")
+  settlement            Settlement    @default(DIRECT)
+  subtotalKurus         Int           @map("subtotal_kurus")
+  manualDiscountKurus   Int           @default(0) @map("manual_discount_kurus")
+  campaignDiscountKurus Int           @default(0) @map("campaign_discount_kurus")
+  totalKurus            Int           @map("total_kurus")
+  /// Ödemelerden türetilen cache; her ödeme işleminde aynı transaction'da güncellenir.
+  paidKurus             Int           @default(0) @map("paid_kurus")
+  estimatedMinutes      Int?          @map("estimated_minutes")
+  acceptedAt            DateTime      @default(now()) @map("accepted_at") @db.Timestamptz(6)
+  workStartedAt         DateTime?     @map("work_started_at") @db.Timestamptz(6)
+  readyAt               DateTime?     @map("ready_at") @db.Timestamptz(6)
+  deliveredAt           DateTime?     @map("delivered_at") @db.Timestamptz(6)
+  cancelledAt           DateTime?     @map("cancelled_at") @db.Timestamptz(6)
+  cancelReason          String?       @map("cancel_reason")
+  notes                 String?
+  createdById           String        @map("created_by_id") @db.Uuid
+  createdAt             DateTime      @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt             DateTime      @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  customer      Customer                 @relation(fields: [customerId], references: [id], onDelete: Restrict)
+  vehicle       Vehicle                  @relation(fields: [vehicleId], references: [id], onDelete: Restrict)
+  vehicleType   VehicleType?             @relation(fields: [vehicleTypeId], references: [id], onDelete: Restrict)
+  createdBy     User                     @relation(fields: [createdById], references: [id], onDelete: Restrict)
+  items         VehicleOrderItem[]
+  statusHistory VehicleStatusHistory[]
+  assignments   VehicleOrderAssignment[]
+  trackingTokens TrackingToken[]
+  payments      Payment[]
+  accountTransaction AccountTransaction?
+
+  @@index([status, acceptedAt])
+  @@index([customerId, acceptedAt])
+  @@index([vehicleId, acceptedAt])
+  @@index([deliveredAt])
+  @@map("vehicle_orders")
+}
+
+model VehicleOrderItem {
+  id                  String   @id @default(uuid(7)) @db.Uuid
+  orderId             String   @map("order_id") @db.Uuid
+  serviceId           String   @map("service_id") @db.Uuid
+  serviceNameSnapshot String   @map("service_name_snapshot")
+  unitPriceKurus      Int      @map("unit_price_kurus")
+  quantity            Int      @default(1)
+  discountKurus       Int      @default(0) @map("discount_kurus")
+  lineTotalKurus      Int      @map("line_total_kurus")
+  vatRateBps          Int      @map("vat_rate_bps")
+  createdAt           DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  order   VehicleOrder @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  service Service      @relation(fields: [serviceId], references: [id], onDelete: Restrict)
+
+  @@index([orderId])
+  @@index([serviceId])
+  @@map("vehicle_order_items")
+}
+
+model VehicleStatusHistory {
+  id          String       @id @default(uuid(7)) @db.Uuid
+  orderId     String       @map("order_id") @db.Uuid
+  fromStatus  OrderStatus? @map("from_status")
+  toStatus    OrderStatus  @map("to_status")
+  changedById String?      @map("changed_by_id") @db.Uuid
+  reason      String?
+  createdAt   DateTime     @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  order     VehicleOrder @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  changedBy User?        @relation(fields: [changedById], references: [id], onDelete: SetNull)
+
+  @@index([orderId, createdAt])
+  @@map("vehicle_status_history")
+}
+
+model VehicleOrderAssignment {
+  id         String   @id @default(uuid(7)) @db.Uuid
+  orderId    String   @map("order_id") @db.Uuid
+  employeeId String   @map("employee_id") @db.Uuid
+  assignedAt DateTime @default(now()) @map("assigned_at") @db.Timestamptz(6)
+
+  order    VehicleOrder @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  employee Employee     @relation(fields: [employeeId], references: [id], onDelete: Restrict)
+
+  @@unique([orderId, employeeId])
+  @@index([employeeId])
+  @@map("vehicle_order_assignments")
+}
+
+/// Müşteri takip linki. Token'ın kendisi saklanmaz, sadece SHA-256 hash'i.
+model TrackingToken {
+  id           String    @id @default(uuid(7)) @db.Uuid
+  orderId      String    @map("order_id") @db.Uuid
+  tokenHash    String    @unique @map("token_hash")
+  expiresAt    DateTime? @map("expires_at") @db.Timestamptz(6)
+  revokedAt    DateTime? @map("revoked_at") @db.Timestamptz(6)
+  lastViewedAt DateTime? @map("last_viewed_at") @db.Timestamptz(6)
+  viewCount    Int       @default(0) @map("view_count")
+  createdAt    DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  order VehicleOrder @relation(fields: [orderId], references: [id], onDelete: Cascade)
+
+  @@index([orderId])
+  @@map("tracking_tokens")
+}
+
+// ─────────────────────── Finans ───────────────────────
+
+model PaymentMethod {
+  id        String            @id @default(uuid(7)) @db.Uuid
+  name      String            @unique
+  kind      PaymentMethodKind
+  isActive  Boolean           @default(true) @map("is_active")
+  sortOrder Int               @default(0) @map("sort_order")
+  createdAt DateTime          @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime          @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  payments Payment[]
+  expenses Expense[]
+
+  @@map("payment_methods")
+}
+
+/// Ödeme ve iade (append-only). amount_kurus her zaman > 0; yönü `type` belirler.
+model Payment {
+  id              String      @id @default(uuid(7)) @db.Uuid
+  type            PaymentType
+  orderId         String?     @map("order_id") @db.Uuid
+  accountId       String?     @map("account_id") @db.Uuid
+  paymentMethodId String      @map("payment_method_id") @db.Uuid
+  amountKurus     Int         @map("amount_kurus")
+  refundOfId      String?     @map("refund_of_id") @db.Uuid
+  receivedAt      DateTime    @default(now()) @map("received_at") @db.Timestamptz(6)
+  businessDate    DateTime    @map("business_date") @db.Date
+  receivedById    String      @map("received_by_id") @db.Uuid
+  idempotencyKey  String?     @unique @map("idempotency_key")
+  note            String?
+  createdAt       DateTime    @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  order              VehicleOrder?       @relation(fields: [orderId], references: [id], onDelete: Restrict)
+  account            CustomerAccount?    @relation(fields: [accountId], references: [id], onDelete: Restrict)
+  paymentMethod      PaymentMethod       @relation(fields: [paymentMethodId], references: [id], onDelete: Restrict)
+  refundOf           Payment?            @relation("PaymentRefunds", fields: [refundOfId], references: [id], onDelete: Restrict)
+  refunds            Payment[]           @relation("PaymentRefunds")
+  receivedBy         User                @relation(fields: [receivedById], references: [id], onDelete: Restrict)
+  cashTransaction    CashTransaction?
+  accountTransaction AccountTransaction?
+
+  @@index([orderId])
+  @@index([accountId])
+  @@index([businessDate])
+  @@index([receivedAt])
+  @@map("payments")
+}
+
+/// Fiziksel kasa hareketleri — SADECE nakit (bkz. docs/01 E-14).
+model CashTransaction {
+  id           String        @id @default(uuid(7)) @db.Uuid
+  direction    CashDirection
+  source       CashSource
+  amountKurus  Int           @map("amount_kurus")
+  paymentId    String?       @unique @map("payment_id") @db.Uuid
+  expenseId    String?       @unique @map("expense_id") @db.Uuid
+  reversalOfId String?       @unique @map("reversal_of_id") @db.Uuid
+  dayCloseId   String?       @map("day_close_id") @db.Uuid
+  businessDate DateTime      @map("business_date") @db.Date
+  description  String?
+  createdById  String        @map("created_by_id") @db.Uuid
+  createdAt    DateTime      @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  payment    Payment?         @relation(fields: [paymentId], references: [id], onDelete: Restrict)
+  expense    Expense?         @relation(fields: [expenseId], references: [id], onDelete: Restrict)
+  reversalOf CashTransaction? @relation("CashReversal", fields: [reversalOfId], references: [id], onDelete: Restrict)
+  reversedBy CashTransaction? @relation("CashReversal")
+  dayClose   CashDayClose?    @relation(fields: [dayCloseId], references: [id], onDelete: Restrict)
+  createdBy  User             @relation(fields: [createdById], references: [id], onDelete: Restrict)
+
+  @@index([businessDate])
+  @@map("cash_transactions")
+}
+
+model CashDayClose {
+  id              String   @id @default(uuid(7)) @db.Uuid
+  businessDate    DateTime @unique @map("business_date") @db.Date
+  openingKurus    Int      @map("opening_kurus")
+  expectedKurus   Int      @map("expected_kurus")
+  countedKurus    Int      @map("counted_kurus")
+  differenceKurus Int      @map("difference_kurus")
+  note            String?
+  closedById      String   @map("closed_by_id") @db.Uuid
+  closedAt        DateTime @default(now()) @map("closed_at") @db.Timestamptz(6)
+
+  closedBy    User              @relation(fields: [closedById], references: [id], onDelete: Restrict)
+  adjustments CashTransaction[]
+
+  @@map("cash_day_closes")
+}
+
+model ExpenseCategory {
+  id        String   @id @default(uuid(7)) @db.Uuid
+  name      String   @unique
+  isActive  Boolean  @default(true) @map("is_active")
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  expenses Expense[]
+
+  @@map("expense_categories")
+}
+
+model Expense {
+  id              String   @id @default(uuid(7)) @db.Uuid
+  categoryId      String   @map("category_id") @db.Uuid
+  paymentMethodId String   @map("payment_method_id") @db.Uuid
+  amountKurus     Int      @map("amount_kurus")
+  expenseDate     DateTime @map("expense_date") @db.Date
+  description     String?
+  reversalOfId    String?  @unique @map("reversal_of_id") @db.Uuid
+  createdById     String   @map("created_by_id") @db.Uuid
+  createdAt       DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  category        ExpenseCategory  @relation(fields: [categoryId], references: [id], onDelete: Restrict)
+  paymentMethod   PaymentMethod    @relation(fields: [paymentMethodId], references: [id], onDelete: Restrict)
+  reversalOf      Expense?         @relation("ExpenseReversal", fields: [reversalOfId], references: [id], onDelete: Restrict)
+  reversedBy      Expense?         @relation("ExpenseReversal")
+  createdBy       User             @relation(fields: [createdById], references: [id], onDelete: Restrict)
+  cashTransaction CashTransaction?
+
+  @@index([expenseDate])
+  @@index([categoryId])
+  @@map("expenses")
+}
+
+/// Kurumsal müşteri cari hesabı.
+model CustomerAccount {
+  id               String   @id @default(uuid(7)) @db.Uuid
+  customerId       String   @unique @map("customer_id") @db.Uuid
+  creditLimitKurus Int?     @map("credit_limit_kurus")
+  paymentTermDays  Int?     @map("payment_term_days")
+  isActive         Boolean  @default(true) @map("is_active")
+  createdAt        DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt        DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  customer     Customer             @relation(fields: [customerId], references: [id], onDelete: Restrict)
+  payments     Payment[]
+  transactions AccountTransaction[]
+
+  @@map("customer_accounts")
+}
+
+model AccountTransaction {
+  id           String             @id @default(uuid(7)) @db.Uuid
+  accountId    String             @map("account_id") @db.Uuid
+  direction    AccountTxDirection
+  amountKurus  Int                @map("amount_kurus")
+  orderId      String?            @unique @map("order_id") @db.Uuid
+  paymentId    String?            @unique @map("payment_id") @db.Uuid
+  reversalOfId String?            @unique @map("reversal_of_id") @db.Uuid
+  businessDate DateTime           @map("business_date") @db.Date
+  description  String?
+  createdAt    DateTime           @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  account    CustomerAccount     @relation(fields: [accountId], references: [id], onDelete: Restrict)
+  order      VehicleOrder?       @relation(fields: [orderId], references: [id], onDelete: Restrict)
+  payment    Payment?            @relation(fields: [paymentId], references: [id], onDelete: Restrict)
+  reversalOf AccountTransaction? @relation("AccountReversal", fields: [reversalOfId], references: [id], onDelete: Restrict)
+  reversedBy AccountTransaction? @relation("AccountReversal")
+
+  @@index([accountId, businessDate])
+  @@map("account_transactions")
+}
+
+// ─────────────────────── Sistem ───────────────────────
+
+model AuditLog {
+  id          String   @id @default(uuid(7)) @db.Uuid
+  actorUserId String?  @map("actor_user_id") @db.Uuid
+  action      String
+  entity      String
+  entityId    String?  @map("entity_id")
+  before      Json?
+  after       Json?
+  ip          String?
+  userAgent   String?  @map("user_agent")
+  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  actor User? @relation(fields: [actorUserId], references: [id], onDelete: SetNull)
+
+  @@index([entity, entityId])
+  @@index([createdAt])
+  @@index([actorUserId])
+  @@map("audit_logs")
+}
+
+/// İşletmeye özgü ayarlar — tek satır (id = 1).
+model BusinessSettings {
+  id                    Int      @id @default(1)
+  businessName          String   @map("business_name")
+  legalName             String?  @map("legal_name")
+  slogan                String?
+  logoPath              String?  @map("logo_path")
+  primaryColor          String   @default("#0e7490") @map("primary_color")
+  phone                 String?
+  whatsappPhone         String?  @map("whatsapp_phone")
+  email                 String?
+  address               String?
+  city                  String?
+  mapLat                Float?   @map("map_lat")
+  mapLng                Float?   @map("map_lng")
+  /// { "mon": { "open": "08:30", "close": "19:00" }, ... , "sun": null }
+  workingHours          Json     @map("working_hours")
+  /// { "instagram": "https://...", "facebook": "..." }
+  socialLinks           Json     @default("{}") @map("social_links")
+  quietHoursStart       String   @default("21:00") @map("quiet_hours_start")
+  quietHoursEnd         String   @default("09:00") @map("quiet_hours_end")
+  trackingTokenTtlHours Int      @default(24) @map("tracking_token_ttl_hours")
+  currency              String   @default("TRY")
+  timeZone              String   @default("Europe/Istanbul") @map("time_zone")
+  updatedAt             DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  @@map("business_settings")
+}
+
+/// Dış servis bağlantı ayarları. Gizli değerler AES-256-GCM ile şifreli.
+model IntegrationSetting {
+  id              String    @id @default(uuid(7)) @db.Uuid
+  provider        String    @unique
+  config          Json      @default("{}")
+  secretEncrypted String?   @map("secret_encrypted")
+  isEnabled       Boolean   @default(false) @map("is_enabled")
+  lastTestAt      DateTime? @map("last_test_at") @db.Timestamptz(6)
+  lastTestResult  String?   @map("last_test_result")
+  updatedAt       DateTime  @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  @@map("integration_settings")
+}
