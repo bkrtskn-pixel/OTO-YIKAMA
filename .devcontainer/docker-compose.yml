@@ -1,0 +1,23 @@
+# GitHub Codespaces / VS Code Dev Container ortamı:
+# Node.js + PostgreSQL bulutta hazır gelir, bilgisayara hiçbir şey kurulmaz.
+services:
+  app:
+    image: mcr.microsoft.com/devcontainers/typescript-node:1-22-bookworm
+    volumes:
+      - ../..:/workspaces:cached
+    command: sleep infinity
+    # PostgreSQL'e localhost:5432 üzerinden erişmek için aynı ağı paylaş
+    network_mode: service:db
+
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: kuzhan
+      POSTGRES_PASSWORD: kuzhan_dev
+      POSTGRES_DB: kuzhan
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+volumes:
+  pgdata:
